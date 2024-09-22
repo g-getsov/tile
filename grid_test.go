@@ -112,12 +112,12 @@ func BenchmarkState(b *testing.B) {
 		}
 	})
 
-	b.Run("range", func(b *testing.B) {
+	b.Run("state", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			cursor, _ := m.At(100, 100)
-			cursor.Range(func(v int) error {
+			cursor.State(func(v int) error {
 				return nil
 			})
 		}
@@ -137,7 +137,7 @@ func BenchmarkState(b *testing.B) {
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			cursor, _ := m.At(100, 100)
-			cursor.Del(100)
+			cursor.Del()
 		}
 	})
 }
@@ -306,29 +306,27 @@ func TestState(t *testing.T) {
 	m := NewGrid(9, 9)
 	m.Each(func(p Point, c Tile[string]) {
 		c.Add(p.String())
-		c.Add(p.String()) // duplicate
+		c.Add(p.String()) // overwrite
 	})
 
 	m.Each(func(p Point, c Tile[string]) {
-		assert.Equal(t, 1, c.Count())
-		assert.NoError(t, c.Range(func(s string) error {
+		assert.NoError(t, c.State(func(s string) error {
 			assert.Equal(t, p.String(), s)
 			return nil
 		}))
 
-		c.Del(p.String())
-		assert.Equal(t, 0, c.Count())
+		c.Del()
 	})
 }
 
-func TestStateRangeErr(t *testing.T) {
+func TestStateErr(t *testing.T) {
 	m := NewGrid(9, 9)
 	m.Each(func(p Point, c Tile[string]) {
 		c.Add(p.String())
 	})
 
 	m.Each(func(p Point, c Tile[string]) {
-		assert.Error(t, c.Range(func(s string) error {
+		assert.Error(t, c.State(func(s string) error {
 			return io.EOF
 		}))
 	})
@@ -388,4 +386,170 @@ func TestConcurrentMerge(t *testing.T) {
 	tile, ok := m.At(1, 1)
 	assert.True(t, ok)
 	assert.Equal(t, uint32(count), tile.Value())
+}
+
+// ----------------------- PageState Tests -----------------------
+
+// Helper function to create a PageState with some initial data
+func createPageState() *PageState[int] {
+	ps := &PageState[int]{}
+	ps.InsertAt(0, 1)
+	ps.InsertAt(1, 2)
+	ps.InsertAt(2, 3)
+	return ps
+}
+
+func TestPageStateInsertAt(t *testing.T) {
+	ps := &PageState[int]{}
+
+	// Test inserting elements
+	for i := 0; i < 9; i++ {
+		if !ps.InsertAt(uint16(i), i+1) {
+			t.Errorf("Failed to insert element %d at index %d", i+1, i)
+		}
+		if ps.Size() != i+1 {
+			t.Errorf("Incorrect size after inserting %d elements. Expected %d, got %d", i+1, i+1, ps.Size())
+		}
+	}
+
+	// Test inserting at an already occupied index (should overwrite)
+	if !ps.InsertAt(0, 10) {
+		t.Error("Failed to overwrite existing element")
+	}
+	if val, ok := ps.Get(0); !ok || val != 10 {
+		t.Error("Failed to get overwritten value")
+	}
+
+	// Test inserting at out of bounds index
+	if ps.InsertAt(9, 100) {
+		t.Error("Should not be able to insert at out of bounds index")
+	}
+}
+
+func TestPageStateGet(t *testing.T) {
+	ps := createPageState()
+
+	// Test getting existing elements
+	for i := uint16(0); i < 3; i++ {
+		val, ok := ps.Get(i)
+		if !ok || val != int(i+1) {
+			t.Errorf("Failed to get correct value at index %d", i)
+		}
+	}
+
+	// Test getting non-existing elements
+	for i := uint16(3); i < 9; i++ {
+		_, ok := ps.Get(i)
+		if ok {
+			t.Errorf("Should not be able to get value at empty index %d", i)
+		}
+	}
+
+	// Test out of bounds
+	_, ok := ps.Get(9)
+	if ok {
+		t.Error("Should not be able to get value at out of bounds index")
+	}
+}
+
+func TestPageStateRemove(t *testing.T) {
+	ps := createPageState()
+
+	// Test removing existing elements
+	object, ok := ps.Remove(1)
+	if !ok || object != 2 {
+		t.Error("Failed to remove existing element")
+	}
+	if ps.Size() != 2 {
+		t.Errorf("Incorrect size after removal. Expected 2, got %d", ps.Size())
+	}
+
+	// Test removing non-existing elements
+	object, ok = ps.Remove(5)
+	if ok || object != 0 {
+		t.Error("Should not be able to remove non-existing element")
+	}
+
+	// Test out of bounds
+	object, ok = ps.Remove(9)
+	if ok || object != 0 {
+		t.Error("Should not be able to remove out of bounds index")
+	}
+}
+
+func TestPageStateSize(t *testing.T) {
+	ps := &PageState[int]{}
+
+	// Test size of empty PageState
+	if ps.Size() != 0 {
+		t.Errorf("Incorrect size of empty PageState. Expected 0, got %d", ps.Size())
+	}
+
+	// Test size after inserting elements
+	for i := 0; i < 5; i++ {
+		ps.InsertAt(uint16(i), i+1)
+		if ps.Size() != i+1 {
+			t.Errorf("Incorrect size after inserting %d elements. Expected %d, got %d", i+1, i+1, ps.Size())
+		}
+	}
+
+	// Test size after removing elements
+	ps.Remove(0)
+	if ps.Size() != 4 {
+		t.Errorf("Incorrect size after removal. Expected 4, got %d", ps.Size())
+	}
+}
+
+func TestPageStateIsPresent(t *testing.T) {
+	ps := createPageState()
+
+	// Test for present elements
+	for i := uint16(0); i < 3; i++ {
+		if !ps.IsPresent(i) {
+			t.Errorf("IsPresent returned false for existing element at index %d", i)
+		}
+	}
+
+	// Test for non-present elements
+	for i := uint16(3); i < 9; i++ {
+		if ps.IsPresent(i) {
+			t.Errorf("IsPresent returned true for non-existing element at index %d", i)
+		}
+	}
+
+	// Test out of bounds
+	if ps.IsPresent(9) {
+		t.Error("IsPresent should return false for out of bounds index")
+	}
+}
+
+func TestPageStateEdgeCases(t *testing.T) {
+	ps := &PageState[int]{}
+
+	// Test inserting and removing to create "holes" in the data
+	ps.InsertAt(0, 1)
+	ps.InsertAt(1, 2)
+	ps.InsertAt(2, 3)
+	ps.Remove(1)
+	ps.InsertAt(3, 4)
+
+	expected := []int{1, 0, 3, 4}
+	for i, exp := range expected {
+		if val, ok := ps.Get(uint16(i)); (exp != 0 && !ok) || val != exp {
+			t.Errorf("Unexpected value at index %d. Expected %d, got %d", i, exp, val)
+		}
+	}
+
+	// Test filling to capacity, removing some, then inserting again
+	for i := 0; i < 9; i++ {
+		ps.InsertAt(uint16(i), i+1)
+	}
+	ps.Remove(0)
+	ps.Remove(8)
+	if !ps.InsertAt(0, 10) {
+		t.Error("Failed to insert element after removing from full PageState")
+	}
+	if !ps.InsertAt(8, 11) {
+		t.Error("Failed to insert element after removing from full PageState")
+	}
 }

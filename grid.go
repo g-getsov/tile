@@ -181,11 +181,11 @@ type Value = uint32
 // page represents a 3x3 tile page each page should neatly fit on a cache
 // line and speed things up.
 type page[T comparable] struct {
-	mu    sync.Mutex  // State lock, 8 bytes
-	state map[T]uint8 // State data, 8 bytes
-	flags uint32      // Page flags, 4 bytes
-	point Point       // Page X, Y coordinate, 4 bytes
-	tiles [9]Value    // Page tiles, 36 bytes
+	mu    sync.Mutex    // State lock, 8 bytes
+	state *PageState[T] // State data, 8 bytes
+	flags uint32        // Page flags, 4 bytes
+	point Point         // Page X, Y coordinate, 4 bytes
+	tiles [9]Value      // Page tiles, 36 bytes
 }
 
 // tileAt reads a tile at a page index
@@ -299,13 +299,13 @@ func (p *page[T]) mergeTile(grid *Grid[T], idx uint8, fn func(Value) Value) Valu
 func (p *page[T]) addObject(grid *Grid[T], idx uint8, object T) {
 	p.Lock()
 
-	// Lazily initialize the map, as most pages might not have anything stored
+	// Lazily initialize the page state, as most pages might not have anything stored
 	// in them (e.g. water or empty tile)
 	if p.state == nil {
-		p.state = make(map[T]uint8)
+		p.state = &PageState[T]{}
 	}
 
-	p.state[object] = uint8(idx)
+	p.state.InsertAt(uint16(idx), object)
 	p.Unlock()
 
 	// If observed, notify the observers of the tile
@@ -321,15 +321,17 @@ func (p *page[T]) addObject(grid *Grid[T], idx uint8, object T) {
 }
 
 // delObject removes the object from the set
-func (p *page[T]) delObject(grid *Grid[T], idx uint8, object T) {
+func (p *page[T]) delObject(grid *Grid[T], idx uint8) {
+	var object T
+	var ok bool
 	p.Lock()
 	if p.state != nil {
-		delete(p.state, object)
+		object, ok = p.state.Remove(uint16(idx))
 	}
 	p.Unlock()
 
-	// If observed, notify the observers of the tile
-	if p.IsObserved() {
+	// If observed and something was removed, notify the observers of the tile
+	if ok && p.IsObserved() {
 		value := p.tileAt(idx)
 		grid.observers.Notify(p.point, &Update[T]{
 			Point: pointOf(p.point, idx),
@@ -349,35 +351,20 @@ type Tile[T comparable] struct {
 	idx  uint8    // tile index
 }
 
-// Count returns number of objects at the current tile.
-func (c Tile[T]) Count() (count int) {
-	c.data.Lock()
-	defer c.data.Unlock()
-	for _, idx := range c.data.state {
-		if idx == uint8(c.idx) {
-			count++
-		}
-	}
-	return
-}
-
 // Value reads the tile information
 func (c Tile[T]) Value() Value {
 	return c.data.tileAt(c.idx)
 }
 
-// Range iterates over all of the objects in the set
-func (c Tile[T]) Range(fn func(T) error) error {
+// State reads the state of the tile
+func (c Tile[T]) State(fn func(T) error) error {
 	c.data.Lock()
 	defer c.data.Unlock()
-	for v, idx := range c.data.state {
-		if idx == uint8(c.idx) {
-			if err := fn(v); err != nil {
-				return err
-			}
-		}
+	state, ok := c.data.state.Get(uint16(c.idx))
+	if !ok {
+		return nil
 	}
-	return nil
+	return fn(state)
 }
 
 // Add adds object to the set
@@ -386,8 +373,8 @@ func (c Tile[T]) Add(v T) {
 }
 
 // Del removes the object from the set
-func (c Tile[T]) Del(v T) {
-	c.data.delObject(c.grid, c.idx, v)
+func (c Tile[T]) Del() {
+	c.data.delObject(c.grid, c.idx)
 }
 
 // Write updates the entire tile value.
@@ -413,5 +400,79 @@ func pointOf(page Point, idx uint8) Point {
 	return Point{
 		X: page.X + int16(idx)%3,
 		Y: page.Y + int16(idx)/3,
+	}
+}
+
+// ---------------------------------- Page State ----------------------------------
+
+// PageState represents a collection of the state values of each element in a page.
+type PageState[T any] struct {
+	data  [9]T
+	flags uint16 // First 9 bits for element presence, last 7 bits for size
+}
+
+// InsertAt inserts a value at a specific index
+func (c *PageState[T]) InsertAt(idx uint16, v T) bool {
+	if !c.isIndexInBounds(idx) {
+		return false
+	}
+	if !c.isSlotOccupied(idx) {
+		c.markSlotOccupied(idx)
+	}
+	c.data[idx] = v
+	return true
+}
+
+// Get returns the value at a specific index
+func (c *PageState[T]) Get(idx uint16) (T, bool) {
+	if !c.isIndexInBounds(idx) || !c.isSlotOccupied(idx) {
+		var zero T
+		return zero, false
+	}
+	return c.data[idx], true
+}
+
+// Remove removes the value at a specific index
+func (c *PageState[T]) Remove(idx uint16) (T, bool) {
+	var zero T
+	if !c.isIndexInBounds(idx) || !c.isSlotOccupied(idx) {
+		return zero, false
+	}
+	c.markSlotEmpty(idx)
+
+	object := c.data[idx]
+	c.data[idx] = zero
+	return object, true
+}
+
+// Size returns the number of state elements in the page
+func (c *PageState[T]) Size() int {
+	return int((c.flags >> 9) & 0x7F) // Mask to ensure we only get the last 7 bits
+}
+
+// IsPresent returns whether the a state value is present at a specific index
+func (c *PageState[T]) IsPresent(idx uint16) bool {
+	return c.isIndexInBounds(idx) && c.isSlotOccupied(idx)
+}
+
+func (c *PageState[T]) isIndexInBounds(idx uint16) bool {
+	return idx < 9
+}
+
+func (c *PageState[T]) isSlotOccupied(idx uint16) bool {
+	return c.flags&(1<<idx) != 0
+}
+
+func (c *PageState[T]) markSlotOccupied(idx uint16) {
+	if !c.isSlotOccupied(idx) {
+		c.flags |= 1 << idx // Mark the slot as occupied
+		c.flags += 1 << 9   // Increment size
+	}
+}
+
+func (c *PageState[T]) markSlotEmpty(idx uint16) {
+	if c.isSlotOccupied(idx) {
+		c.flags &^= 1 << idx // Mark the slot as empty
+		c.flags -= 1 << 9    // Decrement size
 	}
 }

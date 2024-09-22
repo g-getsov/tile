@@ -161,7 +161,7 @@ func TestStateUpdates(t *testing.T) {
 	}, <-v.Inbox)
 
 	// Delete an object from an observed tile
-	cursor.Del("A")
+	cursor.Del()
 	assert.Equal(t, Update[string]{
 		Point: At(5, 5),
 		Old:   Value(0xF0),
